@@ -1,0 +1,364 @@
+
+## Shotgun metagenomic data - Assembled Workflow
+
+## Data analysis workflow used in manuscript:
+## Filthy lucre: A metagenomic pilot study of microbes found on circulating currency in New York City
+## Maritz, J.M., Sullivan, S.A., Prill, R.J. et al. PLOS ONE (2017) 12: 4.
+
+## This analysis was based on the Kalamazoo Metagenome Assembly Protocol v0.8.5
+## See their website for additional details
+## http://khmer-protocols.readthedocs.io/en/latest/metagenomics/
+
+## All data analysis carried out on New York University's High Performance Compute cluster
+## Parameters and file paths may vary on your system
+## Edit commands as necessary to replicate these data analysis locally
+
+
+
+############### Running of jobs ##############
+
+## All of these commands were run using batch jobs so that the same thing was done to all samples with one script
+## To do this you need to create a main directory where you will store and submit your PBS and .sh scripts
+## Within that directory you also need to create one directory per sample that contains the raw sequence fastq files
+## The raw sequence files should be named: Sample_R1.fastq.gz for read1 and Sample_R2.fastq.gz for read 2
+
+## The basic PBS script for all jobs was as follows:
+	## Different modules, run times, memory and threads were required for each job
+	## Approximations are provided for each step
+
+#!/bin/bash
+
+#PBS -q cgsb-s
+#PBS -l nodes=1:ppn=4,walltime=12:00:00,mem=20gb
+#PBS -N Job_name
+#PBS -m a
+#PBS -e localhost:${PBS_O_WORKDIR}/${PBS_JOBNAME}.e${PBS_JOBID}
+
+cd ${PBS_O_WORKDIR}
+
+module load REQUIRED_PROGRAMS
+
+if [ -z ${PBS_ARRAYID} ]; then
+        echo _ERROR_ expecting an array job
+        exit 1
+fi
+
+source NAME_OF_STEP.sh > NAME_OF_STEP.${PBS_ARRAYID}.${PBS_JOBID}.log 2>&1
+
+exit 0
+
+
+############### Trimming of Adapter Sequences ##############
+
+## The adapters were Bio Scientific NEXTflex-96 DNA Barcodes
+## Both the P5, P7 and their reverse compliments were included in fasta format for adapter trimming
+
+## The 'write-trimmomatic.py' script provided with the khmer program was modified to use the custom adapter file not the adapters provided by Trimmomatic
+
+## Took 20gb, 17hrs for largest dataset, 2.5hrs for smallest
+
+#!/bin/bash
+
+#PBS -l nodes=1:ppn=2,walltime=3:30:00,mem=10gb
+#PBS -N trim_test
+#PBS -M jmm1005@nyu.edu
+#PBS -e localhost:$PBS_O_WORKDIR/${PBS_JOBNAME}.e${PBS_JOBID}
+#PBS -m ae
+
+cd ${PBS_O_WORKDIR}
+
+module load khmer/intel/1.1
+module load trimmomatic/0.32
+module load screed/0.7.1
+
+if [ -z ${PBS_ARRAYID} ]; then
+        echo _ERROR_ expecting an array job
+        exit 1
+fi
+
+# The 'query_out_list.txt' file should contain the name of each sample on a different line
+QOLIST=${PBS_O_WORKDIR}/query_out_list.txt
+
+#extract columns from $QOLIST
+COL1=(`cut -f 1 $QOLIST`)
+
+QUERY=${COL1[$PBS_ARRAYID]}
+
+cd ${QUERY}
+
+python /scratch/jmm1005/khmer/sandbox/j-write-trim.py > trim.sh
+
+source trim.sh > ../TRIM.${PBS_ARRAYID}.${PBS_JOBID}.log 2>&1
+
+exit 0
+
+
+############### Quality Trimming and Read Removal ##############
+
+### Remove low quality sequences
+
+## Required modules in the PBS script:
+
+module load fastxtoolkit/intel/0.0.14
+module load libgtextutils/intel/0.7
+module load khmer/intel/1.1
+module load screed/0.7.1
+
+## Took 10gb, 18hrs for largest dataset, 4.5hrs for smallest
+
+## QC.sh script:
+
+#!/bin/bash
+
+QOLIST=${PBS_O_WORKDIR}/query_out_list.txt
+
+# extract columns from $QOLIST
+COL1=(`cut -f 1 $QOLIST`)
+
+QUERY=${COL1[$PBS_ARRAYID]}
+
+cd ${QUERY}
+
+# Make the QC directory
+mkdir QC
+cd QC
+
+# Quality filter
+for i in ../*.pe.fq.gz ../*.se.fq.gz
+do
+    echo working with $i
+    newfile="$(basename $i .fq.gz)"
+    gunzip -c $i | fastq_quality_filter -Q33 -q 30 -p 70 -v | gzip -9c > "${newfile}.qc.fq.gz"
+done
+
+# -q minimum quality score to keep
+# -p percent of bases that must have -q
+# creates *.pe.qc.fq.gz and *.se.qc.fq.gz files
+
+# Extract the pairs
+for i in *.pe.qc.fq.gz
+do
+    extract-paired-reads.py $i
+done
+
+# creates *pe.qc.fq.gz.pe *pe.qc.fq.gz.se
+
+# Rename and combine the se files
+for i in *.pe.qc.fq.gz.pe
+do
+    echo working on PE file $i
+    newfile="$(basename $i .pe.qc.fq.gz.pe).pe.qc.fq"
+    rm $(basename $i .pe)
+    mv $i $newfile
+    gzip $newfile
+done
+ 
+for i in *.pe.qc.fq.gz.se
+do
+    echo working on SE file $i
+    otherfile="$(basename $i .pe.qc.fq.gz.se).se.qc.fq.gz"
+    gunzip -c $otherfile > combine
+    cat $i >> combine
+    rm -f $otherfile
+    gzip -c combine > $otherfile
+    rm $i combine
+done
+
+# puts *.pe.qc.fq.gz.pe into *.pe.qc.fq, removes *.pe.qc.fq.gz.pe, then gzips *.pe.qc.fq
+# puts *.pe.qc.fq.gz.se into *.se.qc.fq.gz, etc.
+
+mv *.qc.fq.gz ../
+cd ..
+rmdir QC
+
+chmod u-w *.qc.fq.gz
+
+
+############### Digital Normalization ##############
+
+## Required modules in the PBS script:
+
+module load khmer/intel/1.1
+module load screed/0.7.1
+
+## Took 36gb, 35hrs for largest dataset, 4hrs for smallest
+
+## normalize.sh script:
+
+#!/bin/bash
+
+QOLIST=${PBS_O_WORKDIR}/query_out_list.txt
+
+# extract columns from $QOLIST
+COL1=(`cut -f 1 $QOLIST`)
+
+QUERY=${COL1[$PBS_ARRAYID]}
+
+cd ${QUERY}
+
+# Make the Normalize directory
+mkdir Normalize
+cd Normalize
+
+# Normalize to k=20
+normalize-by-median.py -p -k 20 -C 20 -N 4 -x 8e9 --savetable normC20k20.kh  ../*.pe.qc.fq.gz
+
+normalize-by-median.py -C 20 --loadtable normC20k20.kh --savetable normC20k20.kh ../*.se.qc.fq.gz
+
+# -N (n_tables) number of hash tables
+# -x (tablesize)
+# see http://khmer.readthedocs.io/en/v1.1/choosing-table-sizes.html for information on choosing these parameters
+
+# Filter low abundance kmers
+filter-abund.py -V normC20k20.kh *.keep
+
+# Extract read pairs
+for i in *.pe.qc.fq.gz.keep.abundfilt
+do
+   extract-paired-reads.py $i
+done
+
+rm normC20k20.kh
+
+# Normalize to k=5
+normalize-by-median.py -C 5 -k 20 -N 4 -x 8e9 --savetable normC5k20.kh -p *.pe.qc.fq.gz.keep.abundfilt.pe
+
+normalize-by-median.py -C 5 --savetable normC5k20.kh --loadtable normC5k20.kh *.pe.qc.fq.gz.keep.abundfilt.se *.se.qc.fq.gz.keep.abundfilt
+
+# Compress, rename files
+for i in *.abundfilt.pe.keep
+do
+    newfile=$(basename $i .pe.qc.fq.gz.keep.abundfilt.pe.keep)
+    echo newfile is $newfile
+    gzip -c $i > $newfile.pe.kak.qc.fq.gz
+done
+
+for i in *.se.qc.fq.gz.keep.abundfilt.keep
+ do
+     pe_orphans=$(basename $i .se.qc.fq.gz.keep.abundfilt.keep).pe.qc.fq.gz.keep.abundfilt.se.keep
+     newfile=$(basename $i .se.qc.fq.gz.keep.abundfilt.keep).se.kak.qc.fq.gz
+    cat $i $pe_orphans | gzip -c > $newfile
+done
+
+# Get read stats for various files
+
+khmer/sandbox/readstats.py *.kak.qc.fq.gz ../*.?e.qc.fq.gz
+
+# The commands below tell you how many reads were lost at which point
+# It takes a while to run, so can be skipped if needed
+
+khmer/sandbox/readstats.py *.?e.qc.fq.gz.keep
+
+khmer/sandbox/readstats.py *.?e.qc.fq.gz.keep.abundfilt
+
+khmer/sandbox/readstats.py *.?e.qc.fq.gz.keep.abundfilt.?e
+
+khmer/sandbox/readstats.py *.?e.qc.fq.gz.keep.abundfilt.*.keep
+
+# If you are short on space you can remove the intermediate files after you get the stats
+rm *.keep *.abundfilt *.pe *.se
+
+# Keep all of the .kak files and move them up a directory
+mv *.kak.qc.fq.gz ../
+cd ..
+
+chmod u-w *.kak.qc.fq.gz
+
+### Partitioning was not performed on this data.
+
+
+############### Assembly ##############
+
+## Required modules in the PBS script:
+module load megahit/intel/0.1.2-r20
+module load quast/intel/2.3
+
+## 80gb memory, 68e9 and 15 threads 10hrs for largest dataset
+## 36gb memory, 34e9 and 5 threads 45min for smallest dataset
+
+## assembly.sh script:
+
+#!/bin/bash
+
+QOLIST=${PBS_O_WORKDIR}/query_out_list.txt
+
+#extract columns from $QOLIST
+COL1=(`cut -f 1 $QOLIST`)
+
+QUERY=${COL1[$PBS_ARRAYID]}
+
+cd ${QUERY}
+
+megahit --cpu-only -m 68e9 --input-cmd "zcat *.kak.qc.fq.gz" -l 101 -t 15 -o Assembly --min-contig-len 200
+
+# -l is max read length
+# -t number of threads
+# only outputs contigs of min length 200
+
+# Rename the final contigs
+mv Assembly/final.contigs.fa Assembly/${QUERY}_final.contigs.fa 
+
+# Get assembly stats
+quast.py Assembly/${QUERY}_final.contigs.fa --threads 12 --contig-thresholds 300,500,1000 --min-contig 200
+
+mv Assembly/${QUERY}_final.contigs.fa ../
+
+
+############### Mapping and Abundance ##############
+
+## The 'make-coverage.py' provided with the khmer program was modified to add the number of hits to a contig instead of the RPKM value
+
+## Required modules in the PBS script:
+module load bowtie/intel/1.0.1
+module load khmer/intel/1.1
+module load screed/0.7.1
+
+## 10gb, 7hrs for largest dataset, 1hr for smallest
+
+## mapping.sh script:
+
+#!/bin/bash
+
+QOLIST=${PBS_O_WORKDIR}/query_out_list.txt
+
+#extract columns from $QOLIST
+COL1=(`cut -f 1 $QOLIST`)
+
+QUERY=${COL1[$PBS_ARRAYID]}
+
+cd ${QUERY}
+
+# Make the Coverage directory
+mkdir Cov
+cd Cov 
+
+# Build the reference
+bowtie-build ../${QUERY}_final.contigs.fa ${QUERY}.metagenome
+
+# Do the mapping
+gunzip -c ../*e.qc.fq.gz | bowtie -q -p 2 ${QUERY}.metagenome - > ${QUERY}.metagenome.map
+
+# bowtie will report only the first valid alignment it encounters
+
+# Get the number of quality filtered reads that map to contigs
+python $PBS_O_WORKDIR/make-coverage.py ${QUERY}_final.contigs.fa ${QUERY}.metagenome.map
+
+# cov=value is the number of reads that hit a contig
+
+# Rename the file with the mapping abundance and move it up a directory
+mv ${QUERY}_final.contigs.fa.cov ${QUERY}.metagenome.fa
+
+mv ${QUERY}.metagenome.fa ../
+
+# Map the reads input into assembler to contigs, tells you how many were assembled
+gunzip -c ../*.kak.qc.fq.gz | bowtie -q -p 2 ${QUERY}.metagenome - > ${QUERY}.kak.metagenome.map \
+	> output.kak.log 2>&1
+
+
+### The resulting contig file with read abundance values (${QUERY}.metagenome.fa) was used as input for a Blast search to assign taxonomy
+
+
+
+
+
+
